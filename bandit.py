@@ -14,7 +14,7 @@ def load_user_config(config_file_path):
         config_data = file.read()
 
     # Semgrep rule bandit.B506 should flag this line
-    parsed_config = yaml.load_all(config_data, Loader=yaml.CLoader a)
+    parsed_config = yaml.load_all(config_data, Loader=yaml.CLoader)
     return parsed_config
 
 
