@@ -1,24 +1,443 @@
+name: Semgrep Reusable workflow
+
 on:
-  workflow_dispatch: {}
-  pull_request: {}
-  push:
-    branches:
-    - main
-    - master
-    paths:
-    - .github/workflows/semgrep.yml
-  schedule:
-  # random HH:MM to avoid a load spike on GitHub Actions at 00:00
-  - cron: 21 15 * * *
-name: Semgrep
+  workflow_call:
+    secrets:
+      SEMGREP_APP_TOKEN:
+        required: true
+    inputs:
+      SEMGREP_REPO_DISPLAY_NAME:
+        description: >
+          Optional display name to group results as a separate project in the
+          Semgrep platform.
+        required: false
+        type: string
+      exclude-patterns:
+        description: >
+          Comma-separated glob patterns to exclude from scanning.
+        required: false
+        default: '*.webp,*.png,*.svg,*.woff,*.woff2,*.jpg,*.glb,*.pdf,*.lock,*.md,*.pro,.github/*'
+        type: string
+      include-patterns:
+        description: >
+          Comma-separated glob patterns to include in scanning.
+        required: false
+        type: string
+      fail-on:
+        description: >
+          Fail the build when findings at this severity are present. One of: CRITICAL ,HIGH, MEDIUM, LOW.
+        required: false
+        type: string
+      upload_sarif:
+        description: >
+          Upload SARIF to GitHub Code Scanning (disable for private repos without GHAS).
+        required: false
+        type: boolean
+        default: true
+      raise-github-issue:
+        description: >
+          When true, create GitHub issues from Semgrep JSON.
+        required: false
+        type: boolean
+        default: false
+      min_severity:
+        description: >
+          Minimum severity to open issues for. One of: low, medium, high, critical. (Default: high)
+        required: false
+        type: string
+        default: high
+      title_prefix:
+        description: Prefix for issue titles.
+        required: false
+        type: string
+        default: "[Semgrep]"
+
 jobs:
   semgrep:
-    name: semgrep/ci
-    runs-on: ubuntu-20.04
+    name: SAST Scan
+    runs-on: ubuntu-22.04
+    if: github.actor != 'dependabot[bot]'
+    permissions:
+      contents: read
     env:
       SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
-    container:
-      image: returntocorp/semgrep
+      SEMGREP_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
     steps:
-    - uses: actions/checkout@v3
-    - run: semgrep ci
+      - uses: actions/checkout@v4
+
+      - name: Run Semgrep Scan
+        uses: DigitalInnovation/semgrep-appsec-workflow/.github/actions/webapps@v2.1.17
+        with:
+          SEMGREP_APP_TOKEN: ${{ env.SEMGREP_APP_TOKEN }}
+          SEMGREP_REPO_URL: ${{ env.SEMGREP_REPO_URL }}
+          SEMGREP_REPO_DISPLAY_NAME: ${{ inputs.SEMGREP_REPO_DISPLAY_NAME }}
+          exclude-patterns: ${{ inputs.exclude-patterns }}
+          include-patterns: ${{ inputs.include-patterns }}
+          fail-on: ${{ inputs.fail-on }}
+
+  semgrep-emit-outputs:
+    name: Generate SARIF & JSON
+    needs: semgrep
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      security-events: write
+    env:
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Semgrep
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install semgrep
+
+      - name: Run Semgrep (JSON)
+        run: |
+          semgrep ci --json --json-output=semgrep.json || true
+
+      - name: Run Semgrep (SARIF)
+        run: |
+          semgrep ci --sarif --output=semgrep.sarif || true
+
+      - name: Upload SARIF to Code Scanning
+        if: inputs.upload_sarif == true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Upload JSON artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-json
+          path: semgrep.json
+          if-no-files-found: warn
+
+  semgrep-alerts-to-issues:
+    name: Alerts → Issues
+    needs: semgrep-emit-outputs
+    if: inputs.raise-github-issue == true && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/heads/') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      MAX_ISSUES_PER_RUN: "500"
+      SLEEP_BETWEEN_ISSUES_MS: "2000"
+      COOLDOWN_AFTER_N: "25"
+      COOLDOWN_MS: "60000"
+      RETRY_COUNT: "6"
+      RETRY_COOLDOWN_MS: "120000"
+      MIN_SEVERITY: ${{ inputs.min_severity }}
+      TITLE_PREFIX: ${{ inputs.title_prefix }}
+    steps:
+      - name: Download semgrep JSON artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: semgrep-json
+          path: .
+
+      - name: Create issues from Semgrep JSON (rename-aware dedupe)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const delay = ms => new Promise(r => setTimeout(r, Number(ms) || 0));
+            const { owner, repo } = context.repo;
+
+            const severityRank = { low:1, medium:2, high:3, critical:4 };
+            const deriveSeverity = (finding) => {
+              const primary = String(finding.severity || '').toLowerCase();
+              if (['critical','high','medium','low'].includes(primary)) return primary;
+              if (primary === 'error') return 'high';
+              if (primary === 'warning') return 'medium';
+              if (primary === 'note' || primary === 'info') return 'low';
+              const metaLevel = String(
+                finding.extra?.metadata?.security_severity_level ||
+                finding.extra?.metadata?.security_severity || ''
+              ).toLowerCase();
+              if (['critical','high','medium','low'].includes(metaLevel)) return metaLevel;
+
+              const impact = String(finding.extra?.metadata?.impact || '').toLowerCase();
+              const likelihood = String(finding.extra?.metadata?.likelihood || '').toLowerCase();
+              if (impact === 'high' && likelihood === 'high') return 'critical';
+              if (impact === 'high' || likelihood === 'high') return 'high';
+              if (impact === 'medium' || likelihood === 'medium') return 'medium';
+              return 'low';
+            };
+
+            const normalizePath = (p) =>
+              String(p || 'unknown-file')
+                .replace(/\\/g,'/')
+                .replace(/^\.\/+/,'')
+                .replace(/\/+/g,'/')
+                .replace(/^\//,'');
+
+            const titlePrefix = process.env.TITLE_PREFIX || '[Semgrep]';
+            const makeIssueKey  = (checkId, filePath, lineNumber) => `${checkId}|${normalizePath(filePath)}|${Number(lineNumber) || 1}`;
+            const formatIssueTitle = (severity, checkId, filePath, lineNumber) =>
+              `${titlePrefix} ${severity.toUpperCase()} – ${checkId} @ ${normalizePath(filePath)}:${Number(lineNumber) || 1}`;
+
+            const minSeverityThreshold = String(process.env.MIN_SEVERITY || 'high').toLowerCase();
+            const maxIssuesPerRun = Number(process.env.MAX_ISSUES_PER_RUN || 500);
+            const perIssueDelayMs = Number(process.env.SLEEP_BETWEEN_ISSUES_MS || 0);
+            const cooldownEveryN = Number(process.env.COOLDOWN_AFTER_N || 0);
+            const cooldownMs = Number(process.env.COOLDOWN_MS || 0);
+            const retryCount = Number(process.env.RETRY_COUNT || 0);
+            const retryCooldownMsDefault = Number(process.env.RETRY_COOLDOWN_MS || 0);
+
+            if (!fs.existsSync('semgrep.json')) { core.info('semgrep.json not found'); return; }
+
+            let findings = JSON.parse(fs.readFileSync('semgrep.json','utf8'))?.results ?? [];
+            findings = findings.filter(f => (severityRank[deriveSeverity(f)] || 0) >= (severityRank[minSeverityThreshold] || 3));
+
+            // Build rule+line -> current paths set
+            const currentPathsByRuleLine = new Map(); // "checkId|line" -> Set(paths)
+            for (const f of findings) {
+              const checkId = f.check_id || 'unknown-rule';
+              const lineNumber = f.start?.line || 1;
+              const ruleLineKey = `${checkId}|${Number(lineNumber) || 1}`;
+              const set = currentPathsByRuleLine.get(ruleLineKey) || new Set();
+              set.add(normalizePath(f.path || 'unknown-file'));
+              currentPathsByRuleLine.set(ruleLineKey, set);
+            }
+
+            // Existing Semgrep issues (open + closed)
+            const [openIssues, closedIssues] = await Promise.all([
+              github.paginate(github.rest.issues.listForRepo, { owner, repo, state: 'open',  labels: 'semgrep' }),
+              github.paginate(github.rest.issues.listForRepo, { owner, repo, state: 'closed', labels: 'semgrep' }),
+            ]);
+
+            const seenFingerprints = new Set(); // semgrep-fingerprint / semgrep-json-fp
+            const seenIssueKeys   = new Set(); // checkId|path|line
+            const issueIndexByKey = new Map(); // key -> {number, state}
+            const reFingerprintSarif = /<!--\s*semgrep-fingerprint:([^\s]+)\s*-->/;
+            const reFingerprintJson  = /<!--\s*semgrep-json-fp:([^\s]+)\s*-->/;
+            const reIssueKey         = /<!--\s*semgrep-key:([^\s]+)\s*-->/;
+            const reTitleParse       = /^\[Semgrep]\s+[A-Z]+\s+[–-]\s+(.+?)\s+@\s+(.+?):(\d+)\s*$/;
+
+            const closedIssuesByRuleLine = new Map(); // `${checkId}|${line}` -> [{ number, path, updated_at }]
+            const indexIssues = (arr, state) => {
+              for (const issue of arr) {
+                const body = issue.body || '';
+                const mSarif = reFingerprintSarif.exec(body); if (mSarif) seenFingerprints.add(mSarif[1]);
+                const mJson  = reFingerprintJson.exec(body);  if (mJson)  seenFingerprints.add(mJson[1]);
+                const mKey   = reIssueKey.exec(body);
+                if (mKey) { seenIssueKeys.add(mKey[1]); issueIndexByKey.set(mKey[1], { number: issue.number, state }); }
+                const titleMatch = reTitleParse.exec(issue.title || '');
+                if (titleMatch) {
+                  const [ , parsedCheckId, parsedPath, parsedLine ] = titleMatch;
+                  const parsedKey = `${parsedCheckId}|${normalizePath(parsedPath)}|${Number(parsedLine) || 1}`;
+                  seenIssueKeys.add(parsedKey);
+                  if (!issueIndexByKey.has(parsedKey)) issueIndexByKey.set(parsedKey, { number: issue.number, state });
+                  if (state === 'closed') {
+                    const ruleLineKey = `${parsedCheckId}|${Number(parsedLine) || 1}`;
+                    const list = closedIssuesByRuleLine.get(ruleLineKey) || [];
+                    list.push({ number: issue.number, path: normalizePath(parsedPath), updated_at: issue.updated_at });
+                    closedIssuesByRuleLine.set(ruleLineKey, list);
+                  }
+                }
+              }
+            };
+            indexIssues(openIssues, 'open');
+            indexIssues(closedIssues, 'closed');
+
+            // Ensure labels
+            const ensureLabel = async (name, color, description) => {
+              try { await github.rest.issues.getLabel({ owner, repo, name }); }
+              catch { await github.rest.issues.createLabel({ owner, repo, name, color, description }); }
+            };
+            await ensureLabel('semgrep', '0E8A16', 'Semgrep findings');
+            await ensureLabel('security', 'FBCA04', 'Security related');
+            for (const level of ['low','medium','high','critical']) {
+              await ensureLabel(`severity:${level}`, {low:'D4D4D4',medium:'FBCA04',high:'E11D21',critical:'8B0000'}[level], `Severity: ${level}`);
+            }
+
+            findings.sort((a,b) => (severityRank[deriveSeverity(b)] || 0) - (severityRank[deriveSeverity(a)] || 0));
+
+            let createdCount = 0, reopenedCount = 0, skippedCount = 0;
+
+            for (const f of findings) {
+              if (createdCount >= maxIssuesPerRun) break;
+
+              const checkId = f.check_id || 'unknown-rule';
+              const filePath = f.path || 'unknown-file';
+              const lineNumber = f.start?.line || 1;
+              const severity = deriveSeverity(f);
+              const messageText = f.extra?.message || '';
+              const ruleShortlink = f.extra?.metadata?.shortlink || f.extra?.metadata?.references?.[0] || '';
+              const cweList = Array.isArray(f.extra?.metadata?.cwe) ? f.extra.metadata.cwe : [];
+              const owaspList = Array.isArray(f.extra?.metadata?.owasp) ? f.extra.metadata.owasp : [];
+
+              const fingerprintSarif = `sarif:${checkId}|${normalizePath(filePath)}|${Number(lineNumber) || 1}`;
+              const fingerprintJson  = f.fingerprint ? `json:${f.fingerprint}` : null;
+              const issueKey         = makeIssueKey(checkId, filePath, lineNumber);
+
+              // Exact dedupe
+              if (seenFingerprints.has(fingerprintSarif) || (fingerprintJson && seenFingerprints.has(fingerprintJson)) || seenIssueKeys.has(issueKey)) {
+                skippedCount++;
+                continue;
+              }
+
+              // Rename-aware reopen ONLY if old path is no longer present
+              const ruleLineKey = `${checkId}|${Number(lineNumber) || 1}`;
+              const currentPathsForRuleLine = currentPathsByRuleLine.get(ruleLineKey) || new Set();
+              const renameCandidates = (closedIssuesByRuleLine.get(ruleLineKey) || []).filter(x => x.path !== normalizePath(filePath));
+
+              const oldPathStillPresent = renameCandidates.some(c => currentPathsForRuleLine.has(c.path));
+              if (renameCandidates.length && !oldPathStillPresent) {
+                renameCandidates.sort((a,b) => new Date(b.updated_at) - new Date(a.updated_at));
+                const targetIssue = renameCandidates[0];
+                const newTitle = formatIssueTitle(severity, checkId, filePath, lineNumber);
+
+                await github.rest.issues.update({ owner, repo, issue_number: targetIssue.number, state: 'open', title: newTitle });
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: targetIssue.number,
+                  body: [
+                    `<!-- semgrep-key:${issueKey} -->`,
+                    `<!-- semgrep-fingerprint:${fingerprintSarif} -->`,
+                    fingerprintJson ? `<!-- semgrep-json-fp:${fingerprintJson} -->` : '',
+                    'Reopening due to probable file rename/copy where old location is no longer present. Location updated.'
+                  ].filter(Boolean).join('\n')
+                });
+
+                reopenedCount++;
+                seenFingerprints.add(fingerprintSarif); if (fingerprintJson) seenFingerprints.add(fingerprintJson); seenIssueKeys.add(issueKey);
+                if (perIssueDelayMs > 0) await delay(perIssueDelayMs);
+                continue;
+              }
+
+              // Different file still present → open a new issue (legit separate occurrence)
+              const issueTitle = formatIssueTitle(severity, checkId, filePath, lineNumber);
+              const metaLines = [];
+              if (cweList.length) metaLines.push(`**CWE:** ${cweList.join(', ')}`);
+              if (owaspList.length) metaLines.push(`**OWASP:** ${owaspList.join(', ')}`);
+              if (ruleShortlink) metaLines.push(`**Rule:** ${ruleShortlink}`);
+
+              const issueBody = [
+                `<!-- semgrep-key:${issueKey} -->`,
+                `<!-- semgrep-fingerprint:${fingerprintSarif} -->`,
+                fingerprintJson ? `<!-- semgrep-json-fp:${fingerprintJson} -->` : '',
+                `**Rule:** \`${checkId}\``,
+                `**Location:** \`${normalizePath(filePath)}:${Number(lineNumber) || 1}\``,
+                `**Severity:** \`${severity.toUpperCase()}\``,
+                metaLines.length ? metaLines.join('\n') : '',
+                '',
+                messageText,
+                '',
+                `_Source: Semgrep JSON output._`
+              ].filter(Boolean).join('\n');
+
+              let attemptCount = 0;
+              while (true) {
+                try {
+                  await github.rest.issues.create({ owner, repo, title: issueTitle, body: issueBody, labels: ['semgrep', 'security', `severity:${severity}`] });
+                  break;
+                } catch (err) {
+                  let waitMs = retryCooldownMsDefault;
+                  const headers = err?.response?.headers || {};
+                  if (headers['retry-after']) {
+                    const retryAfterSeconds = Number(headers['retry-after']);
+                    if (!Number.isNaN(retryAfterSeconds)) waitMs = Math.max(waitMs, retryAfterSeconds * 1000);
+                  }
+                  const messageLower = String(err?.message || '').toLowerCase();
+                  if ((err.status === 403 && messageLower.includes('secondary rate limit')) || err.status === 429) {
+                    if (attemptCount < retryCount) { attemptCount++; await delay(waitMs); continue; }
+                  }
+                  throw err;
+                }
+              }
+
+              if (fingerprintJson) seenFingerprints.add(fingerprintJson);
+              seenFingerprints.add(fingerprintSarif);
+              seenIssueKeys.add(issueKey);
+              createdCount++;
+              if (perIssueDelayMs > 0) await delay(perIssueDelayMs);
+              if (cooldownEveryN > 0 && createdCount % cooldownEveryN === 0) await delay(cooldownMs);
+            }
+
+            core.summary.addRaw(`New issues created: ${createdCount}\nReopened (real renames): ${reopenedCount}\nSkipped (exact dups): ${skippedCount}`).write()
+
+  close-resolved-semgrep-issues:
+    name: Close resolved Semgrep issues
+    needs: semgrep-alerts-to-issues
+    if: inputs.raise-github-issue == true && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/heads/') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      security-events: read
+    env:
+      MAX_CLOSES_PER_RUN: "40"
+      SLEEP_BETWEEN_CLOSES_MS: "800"
+      COOLDOWN_AFTER_N: "20"
+      COOLDOWN_MS: "50000"
+    steps:
+      - name: Close resolved Semgrep issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const delay = ms => new Promise(r => setTimeout(r, Number(ms) || 0));
+            const { owner, repo } = context.repo;
+
+            const repoInfo = await github.rest.repos.get({ owner, repo });
+            const defaultBranch = repoInfo.data.default_branch;
+            const defaultRef = `refs/heads/${defaultBranch}`;
+
+            let codeScanningAlerts = await github.paginate(
+              github.rest.codeScanning.listAlertsForRepo,
+              { owner, repo, state: 'open', ref: defaultRef }
+            ).catch(e => (e.status === 404 ? [] : Promise.reject(e)));
+
+            if (!codeScanningAlerts.length) {
+              codeScanningAlerts = await github.paginate(
+                github.rest.codeScanning.listAlertsForRepo,
+                { owner, repo, state: 'open' }
+              ).catch(e => (e.status === 404 ? [] : Promise.reject(e)));
+            }
+
+            codeScanningAlerts = codeScanningAlerts.filter(a => /semgrep/i.test(a.tool?.name || ''));
+
+            const activeFingerprints = new Set();
+            for (const alert of codeScanningAlerts) {
+              const ruleId = alert.rule?.id || alert.rule?.name || 'unknown-rule';
+              const instance = alert.most_recent_instance || {};
+              const filePath = instance.location?.path || 'unknown-file';
+              const lineNumber = instance.location?.start_line || 1;
+              activeFingerprints.add(`sarif:${ruleId}|${filePath}|${lineNumber}`);
+            }
+
+            const maxClosePerRun = Number(process.env.MAX_CLOSES_PER_RUN || 40);
+            const perCloseDelayMs = Number(process.env.SLEEP_BETWEEN_CLOSES_MS || 800);
+            const cooldownEveryN = Number(process.env.COOLDOWN_AFTER_N || 20);
+            const cooldownMs = Number(process.env.COOLDOWN_MS || 50000);
+
+            const semgrepLabeledIssues = await github.paginate(
+              github.rest.issues.listForRepo, { owner, repo, state: 'open', labels: 'semgrep' }
+            );
+
+            let closedCount = 0;
+            for (const issue of semgrepLabeledIssues) {
+              if (closedCount >= maxClosePerRun) break;
+              const match = /<!--\s*semgrep-fingerprint:(.+?)\s*-->/.exec(issue.body || '');
+              if (!match) continue;
+              const fingerprint = match[1];
+
+              if (!activeFingerprints.has(fingerprint)) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issue.number,
+                  body: 'Auto-closing: the corresponding Code Scanning alert is no longer present.'
+                });
+                await github.rest.issues.update({ owner, repo, issue_number: issue.number, state: 'closed' });
+                closedCount++;
+                if (perCloseDelayMs > 0) await delay(perCloseDelayMs);
+                if (cooldownEveryN > 0 && closedCount % cooldownEveryN === 0) await delay(cooldownMs);
+              }
+            }
+
+            core.summary.addRaw(`Issues auto-closed: ${closedCount}`).write()
