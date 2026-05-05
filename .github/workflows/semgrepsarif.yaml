@@ -37,9 +37,9 @@ jobs:
           path = "semgrep.sarif"
 
           mapping = {
-              "High": 9.0,
-              "Medium": 6.0,
-              "Low": 4.0
+              "High": "9.0",
+              "Medium": "6.0",
+              "Low": "4.0"
           }
 
           with open(path, "r", encoding="utf-8") as f:
