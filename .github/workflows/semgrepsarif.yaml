@@ -17,15 +17,52 @@ jobs:
 
     env:
       SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
     container:
       image: semgrep/semgrep
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Run Semgrep (SARIF)
         run: |
-          semgrep ci --sarif --output=semgrep.sarif || true
+          semgrep ci --code --sarif --output=semgrep.sarif || true
+
+      - name: Normalize SARIF security-severity
+        run: |
+          python3 <<'PY'
+          import json
+
+          path = "semgrep.sarif"
+
+          mapping = {
+              "High": 9.0,
+              "Medium": 6.0,
+              "Low": 4.0
+          }
+
+          with open(path, "r", encoding="utf-8") as f:
+              sarif = json.load(f)
+
+          for run in sarif.get("runs", []):
+              rules = (
+                  run.get("tool", {})
+                     .get("driver", {})
+                     .get("rules", [])
+              )
+
+              for rule in rules:
+                  props = rule.get("properties", {})
+                  value = props.get("security-severity")
+
+                  if isinstance(value, str) and value in mapping:
+                      props["security-severity"] = mapping[value]
+
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(sarif, f, indent=2)
+
+          PY
 
       - name: Upload SARIF file
         continue-on-error: true
